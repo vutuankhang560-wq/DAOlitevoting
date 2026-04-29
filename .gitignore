@@ -1,0 +1,12 @@
+# Rust
+target
+
+# Local Stellar / Soroban CLI state
+.soroban
+.stellar
+
+# Frontend
+frontend/node_modules
+frontend/dist
+frontend/.env
+frontend/.env.local
