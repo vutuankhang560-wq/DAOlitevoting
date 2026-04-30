@@ -16,6 +16,8 @@ import type { xdr } from '@stellar/stellar-sdk';
 
 import {
   CONTRACT_ID,
+  GOV_TOKEN_DECIMALS,
+  GOV_TOKEN_ID,
   HORIZON_URL,
   NETWORK_PASSPHRASE,
   RPC_URL,
@@ -28,18 +30,21 @@ export {
   type ContractErrorCategory,
   decodeSimError,
   deriveOutcome,
+  formatTokenAmount,
   hoursToSeconds,
   isLikelyStellarAddress,
   type ProposalOutcome,
   relativeTime,
   stroopsToXlm,
   xlmToStroops,
+  yesPercent,
 } from './lib';
 
 export const sorobanServer = new rpc.Server(RPC_URL);
 export const horizonServer = new Horizon.Server(HORIZON_URL);
 
 const votingContract = () => new Contract(CONTRACT_ID);
+const govTokenContract = () => new Contract(GOV_TOKEN_ID);
 
 // Read-only sims don't commit, so any structurally valid Stellar address works.
 const READ_ONLY_SOURCE =
@@ -58,8 +63,12 @@ export type Proposal = {
   description: string;
   createdAt: bigint;
   endTime: bigint;
-  yesCount: number;
-  noCount: number;
+  /** Total weighted yes votes — sum of `gov_token.balance(voter)` snapshots. */
+  yesWeight: bigint;
+  /** Total weighted no votes — sum of `gov_token.balance(voter)` snapshots. */
+  noWeight: bigint;
+  /** Number of distinct voters across both sides. */
+  voterCount: number;
 };
 
 export type VotedEvent = {
@@ -69,6 +78,8 @@ export type VotedEvent = {
   proposalId: number;
   voter: string;
   support: boolean;
+  /** Weight that was tallied — pulled from event payload `topic[2]`. */
+  weight: bigint;
   txHash?: string;
 };
 
@@ -451,8 +462,9 @@ export async function getProposal(id: number): Promise<Proposal> {
       description: string;
       created_at: number | bigint;
       end_time: number | bigint;
-      yes_count: number | bigint;
-      no_count: number | bigint;
+      yes_weight: number | bigint;
+      no_weight: number | bigint;
+      voter_count: number | bigint;
     }>(votingContract(), 'get_proposal', [
       nativeToScVal(id, { type: 'u32' }),
     ]);
@@ -469,8 +481,15 @@ export async function getProposal(id: number): Promise<Proposal> {
         typeof raw.end_time === 'bigint'
           ? raw.end_time
           : BigInt(raw.end_time),
-      yesCount: Number(raw.yes_count),
-      noCount: Number(raw.no_count),
+      yesWeight:
+        typeof raw.yes_weight === 'bigint'
+          ? raw.yes_weight
+          : BigInt(raw.yes_weight),
+      noWeight:
+        typeof raw.no_weight === 'bigint'
+          ? raw.no_weight
+          : BigInt(raw.no_weight),
+      voterCount: Number(raw.voter_count),
     };
   });
 }
@@ -548,11 +567,19 @@ async function fetchVotedFresh(
       const topicName = String(topics[0] ?? '');
       if (topicName !== 'voted') continue;
       const voter = String(topics[1] ?? '');
+      // L4: event payload is now `(id, support, weight)`. Older events from
+      // the L3-only contract emitted `(id, support)`; treat the missing
+      // weight as 0 rather than dropping the event.
       const value = scValToNative(ev.value) as
         | [number | bigint, boolean]
+        | [number | bigint, boolean, number | bigint]
         | undefined;
       if (!value) continue;
-      const [proposalId, support] = value;
+      const [proposalId, support, weight] = value as [
+        number | bigint,
+        boolean,
+        number | bigint | undefined,
+      ];
       out.push({
         id: ev.id,
         ledger: ev.ledger,
@@ -560,6 +587,12 @@ async function fetchVotedFresh(
         proposalId: Number(proposalId),
         voter,
         support: Boolean(support),
+        weight:
+          weight === undefined
+            ? 0n
+            : typeof weight === 'bigint'
+              ? weight
+              : BigInt(weight),
         txHash: ev.txHash,
       });
     } catch (err) {
@@ -567,6 +600,176 @@ async function fetchVotedFresh(
     }
   }
   return out.reverse();
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// L4 — Gov-token reads (the inter-contract callee, exposed for the UI)
+// ──────────────────────────────────────────────────────────────────────────
+
+const GOV_TTL_MS = 6_000;
+
+/** Read the connected wallet's governance-token balance (raw base units —
+ *  caller formats with `formatTokenAmount` + GOV_TOKEN_DECIMALS). Returns 0
+ *  when the gov-token isn't configured rather than throwing. */
+export async function getGovBalance(address: string): Promise<bigint> {
+  if (!GOV_TOKEN_ID) return 0n;
+  return cached(`gov:bal:${address}`, GOV_TTL_MS, async () => {
+    const v = await readView<bigint | number>(govTokenContract(), 'balance', [
+      Address.fromString(address).toScVal(),
+    ]);
+    return typeof v === 'bigint' ? v : BigInt(v);
+  });
+}
+
+export async function getGovSymbol(): Promise<string> {
+  if (!GOV_TOKEN_ID) return '';
+  return cached('gov:symbol', 60_000, async () => {
+    return readView<string>(govTokenContract(), 'symbol');
+  });
+}
+
+export async function getGovDecimals(): Promise<number> {
+  if (!GOV_TOKEN_ID) return GOV_TOKEN_DECIMALS;
+  return cached('gov:decimals', 60_000, async () => {
+    const v = await readView<number | bigint>(govTokenContract(), 'decimals');
+    return Number(v);
+  });
+}
+
+export async function getGovTotalSupply(): Promise<bigint> {
+  if (!GOV_TOKEN_ID) return 0n;
+  return cached('gov:supply', GOV_TTL_MS, async () => {
+    const v = await readView<bigint | number>(
+      govTokenContract(),
+      'total_supply',
+    );
+    return typeof v === 'bigint' ? v : BigInt(v);
+  });
+}
+
+/** Admin-only: mint `amount` (in base units) of the gov-token to `to`. The
+ *  caller MUST be the gov-token's admin or the simulation rejects with the
+ *  SEP-41 "AuthError". Surfaces typed errors so the UI can render a clean
+ *  banner. */
+export async function mintGovTokens(opts: {
+  sender: string;
+  to: string;
+  amount: bigint;
+  onStatus?: (status: TxStatus) => void;
+}): Promise<string> {
+  if (!GOV_TOKEN_ID) {
+    throw new ContractError(
+      'No gov-token configured. Set VITE_GOV_TOKEN_ID in frontend/.env.',
+      'validation',
+    );
+  }
+  const { sender, to, amount, onStatus } = opts;
+  if (amount <= 0n) {
+    throw new ContractError('Mint amount must be greater than 0.', 'validation');
+  }
+  const args: xdr.ScVal[] = [
+    Address.fromString(to).toScVal(),
+    nativeToScVal(amount, { type: 'i128' }),
+  ];
+  const { hash } = await invokeArbitrary({
+    sender,
+    contract: govTokenContract(),
+    fnName: 'mint',
+    args,
+    onStatus,
+  });
+  invalidateReads('gov:');
+  return hash;
+}
+
+/** Same Soroban write pipeline as `invokeContract`, but parameterised on the
+ *  target contract so it can drive the gov-token's `mint` op too. */
+async function invokeArbitrary(opts: {
+  sender: string;
+  contract: Contract;
+  fnName: string;
+  args: xdr.ScVal[];
+  onStatus?: (status: TxStatus) => void;
+}): Promise<{ hash: string; returnValue: unknown }> {
+  const { sender, contract, fnName, args, onStatus } = opts;
+
+  onStatus?.('preparing');
+
+  let sourceAccount: Account;
+  try {
+    sourceAccount = await sorobanServer.getAccount(sender);
+  } catch (err) {
+    const msg = (err as Error).message || '';
+    if (msg.toLowerCase().includes('not found')) {
+      throw new ContractError(
+        'Account does not exist on testnet — fund it from friendbot first.',
+        'rpc',
+      );
+    }
+    throw new ContractError(`Could not load account: ${msg}`, 'rpc');
+  }
+
+  const baseTx = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(fnName, ...args))
+    .setTimeout(60)
+    .build();
+
+  const sim = await sorobanServer.simulateTransaction(baseTx);
+  if (rpc.Api.isSimulationError(sim)) {
+    throw new ContractError(decodeSimError(sim.error), 'simulation');
+  }
+
+  const prepared = rpc.assembleTransaction(baseTx, sim).build();
+
+  onStatus?.('signing');
+  let signedXdr: string;
+  try {
+    signedXdr = await signXdr(prepared.toXDR(), sender);
+  } catch (err) {
+    throw mapWalletError(err);
+  }
+
+  onStatus?.('submitting');
+  const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+  const sendRes = await sorobanServer.sendTransaction(signedTx);
+  if (sendRes.status === 'ERROR') {
+    const name = sendRes.errorResult?.result().switch().name ?? 'unknown';
+    if (name.toLowerCase().includes('insufficient')) {
+      throw new ContractError(
+        'Insufficient balance — your wallet does not have enough XLM to cover the fee.',
+        'insufficient-balance',
+      );
+    }
+    throw new ContractError(`Submission rejected: ${name}`, 'submission');
+  }
+
+  onStatus?.('confirming');
+  let getRes = await sorobanServer.getTransaction(sendRes.hash);
+  const start = Date.now();
+  while (getRes.status === 'NOT_FOUND') {
+    if (Date.now() - start > 30_000) {
+      throw new ContractError('Timed out waiting for confirmation.', 'rpc');
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+    getRes = await sorobanServer.getTransaction(sendRes.hash);
+  }
+
+  if (getRes.status !== 'SUCCESS') {
+    throw new ContractError(
+      `Transaction failed on-chain: ${getRes.status}`,
+      'submission',
+    );
+  }
+
+  const returnValue =
+    getRes.returnValue !== undefined
+      ? scValToNative(getRes.returnValue)
+      : undefined;
+
+  return { hash: sendRes.hash, returnValue };
 }
 
 // ──────────────────────────────────────────────────────────────────────────

@@ -3,11 +3,13 @@ import {
   ContractError,
   decodeSimError,
   deriveOutcome,
+  formatTokenAmount,
   hoursToSeconds,
   isLikelyStellarAddress,
   relativeTime,
   stroopsToXlm,
   xlmToStroops,
+  yesPercent,
 } from './lib';
 
 describe('xlmToStroops', () => {
@@ -172,6 +174,71 @@ describe('deriveOutcome', () => {
         nowSecs: now,
       }),
     ).toBe('passed');
+  });
+
+  it('handles bigint weighted tallies past safe integer range', () => {
+    // ~10^24 — way past Number.MAX_SAFE_INTEGER (~9 * 10^15).
+    const huge = 1_000_000_000_000_000_000_000_000n;
+    expect(
+      deriveOutcome({
+        yes: huge,
+        no: huge - 1n,
+        endSecs: now - 1,
+        nowSecs: now,
+      }),
+    ).toBe('passed');
+    expect(
+      deriveOutcome({
+        yes: huge,
+        no: huge,
+        endSecs: now - 1,
+        nowSecs: now,
+      }),
+    ).toBe('failed'); // ties fail
+  });
+});
+
+describe('formatTokenAmount', () => {
+  it('formats whole-token amounts with 7 decimals (gov-token default)', () => {
+    expect(formatTokenAmount(10_000_000n, 7)).toBe('1');
+    expect(formatTokenAmount(0n, 7)).toBe('0');
+  });
+
+  it('strips trailing zeros and groups thousands', () => {
+    expect(formatTokenAmount(1_500_000_000n, 7)).toBe('150');
+    expect(formatTokenAmount(123_456_789_000_000n, 7)).toBe('12,345,678.9');
+  });
+
+  it('handles a zero-decimal token (e.g. plain integer counter)', () => {
+    expect(formatTokenAmount(1_500n, 0)).toBe('1,500');
+  });
+
+  it('handles negative values', () => {
+    expect(formatTokenAmount(-10_000_000n, 7)).toBe('-1');
+  });
+});
+
+describe('yesPercent', () => {
+  it('returns 0 when no votes', () => {
+    expect(yesPercent(0n, 0n)).toBe(0);
+  });
+
+  it('returns 100 when only yes votes', () => {
+    expect(yesPercent(50n, 0n)).toBe(100);
+  });
+
+  it('returns 0 when only no votes', () => {
+    expect(yesPercent(0n, 50n)).toBe(0);
+  });
+
+  it('rounds to a clean integer', () => {
+    expect(yesPercent(1n, 2n)).toBe(33); // 33.33...
+    expect(yesPercent(2n, 1n)).toBe(67); // 66.66...
+  });
+
+  it('handles huge weights without precision loss', () => {
+    const huge = 1_000_000_000_000_000_000n;
+    expect(yesPercent(huge, huge)).toBe(50);
   });
 });
 

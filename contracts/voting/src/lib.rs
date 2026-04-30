@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
+};
 
 const MAX_TITLE_LEN: u32 = 80;
 const MAX_DESCRIPTION_LEN: u32 = 280;
@@ -15,17 +17,27 @@ pub struct Proposal {
     pub description: String,
     pub created_at: u64,
     pub end_time: u64,
-    pub yes_count: u32,
-    pub no_count: u32,
+    /// Weighted yes votes — sum of `gov_token.balance(voter)` across all yes
+    /// voters at the moment they cast their vote.
+    pub yes_weight: i128,
+    /// Weighted no votes — same as `yes_weight` but for "no" voters.
+    pub no_weight: i128,
+    /// Number of distinct voters (any side). Useful to differentiate "no votes
+    /// yet" from "lots of zero-weight attempts" client-side.
+    pub voter_count: u32,
 }
 
 #[contracttype]
 pub enum DataKey {
     Admin,
+    GovToken,
     ProposalCount,
     Proposal(u32),
     HasVoted(u32, Address),
     Vote(u32, Address),
+    /// Snapshot of the voter's gov-token balance at the moment they cast — so
+    /// later balance changes don't retroactively rewrite tallies.
+    VoteWeight(u32, Address),
     ProposalsByCreator(Address),
 }
 
@@ -34,12 +46,11 @@ pub struct Voting;
 
 #[contractimpl]
 impl Voting {
-    /// Constructor — wires the admin address. The admin isn't required to do
-    /// anything in v1 (proposals close on a wall-clock timer, not by an admin
-    /// call), but the slot is reserved so a future "force-close abusive
-    /// proposal" admin op can land without a storage migration.
-    pub fn __constructor(env: Env, admin: Address) {
+    /// Constructor — wires the admin and the SEP-41 governance token whose
+    /// `balance(voter)` will be the voter's weight in `cast_vote`.
+    pub fn __constructor(env: Env, admin: Address, gov_token: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::GovToken, &gov_token);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
     }
 
@@ -88,8 +99,9 @@ impl Voting {
             description: description.clone(),
             created_at: now,
             end_time: now + voting_window_secs,
-            yes_count: 0,
-            no_count: 0,
+            yes_weight: 0,
+            no_weight: 0,
+            voter_count: 0,
         };
         env.storage()
             .persistent()
@@ -112,8 +124,10 @@ impl Voting {
         next_id
     }
 
-    /// Cast a yes/no vote on `id`. Must be before `end_time` and the voter
-    /// can only vote once per proposal.
+    /// Cast a yes/no vote on `id`. Vote weight is the voter's current
+    /// balance on the configured governance token, fetched via an
+    /// inter-contract `balance` call. Voters with zero balance are
+    /// rejected — the DAO doesn't count "phantom" votes.
     pub fn cast_vote(env: Env, id: u32, voter: Address, support: bool) {
         voter.require_auth();
 
@@ -133,11 +147,28 @@ impl Voting {
             panic!("already voted");
         }
 
-        if support {
-            proposal.yes_count += 1;
-        } else {
-            proposal.no_count += 1;
+        // ── L4 inter-contract call ────────────────────────────────────────
+        // Read the voter's gov-token balance from the deployed SEP-41
+        // contract. `voter.require_auth()` above plus the SDK's sub-invocation
+        // auth-chain rules mean the wallet's signature on `cast_vote` also
+        // covers this read. (It's a pure view, so even a fully open auth
+        // configuration would be safe — no value moves.)
+        let gov_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovToken)
+            .expect("contract not initialized");
+        let weight = token::Client::new(&env, &gov_token).balance(&voter);
+        if weight <= 0 {
+            panic!("no voting power");
         }
+
+        if support {
+            proposal.yes_weight += weight;
+        } else {
+            proposal.no_weight += weight;
+        }
+        proposal.voter_count += 1;
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(id), &proposal);
@@ -145,15 +176,25 @@ impl Voting {
         env.storage()
             .persistent()
             .set(&DataKey::Vote(id, voter.clone()), &support);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VoteWeight(id, voter.clone()), &weight);
 
         env.events()
-            .publish((symbol_short!("voted"), voter), (id, support));
+            .publish((symbol_short!("voted"), voter), (id, support, weight));
     }
 
     pub fn admin(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
+            .expect("contract not initialized")
+    }
+
+    pub fn gov_token(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::GovToken)
             .expect("contract not initialized")
     }
 
@@ -182,6 +223,15 @@ impl Voting {
     /// they haven't voted yet.
     pub fn get_vote(env: Env, id: u32, voter: Address) -> Option<bool> {
         env.storage().persistent().get(&DataKey::Vote(id, voter))
+    }
+
+    /// Returns the voter's recorded weight at the moment they cast their
+    /// vote, or 0 if they haven't voted.
+    pub fn get_vote_weight(env: Env, id: u32, voter: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VoteWeight(id, voter))
+            .unwrap_or(0)
     }
 
     pub fn is_active(env: Env, id: u32) -> bool {

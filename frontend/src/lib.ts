@@ -113,21 +113,67 @@ export function relativeTime(
  *  - 'passed': closed and yes > no
  *  - 'failed': closed and no >= yes (ties fail by default)
  *  - 'open': still in voting window
- *  - 'pending': closed with zero votes — neither passed nor failed clearly */
+ *  - 'pending': closed with zero votes — neither passed nor failed clearly
+ *
+ *  `yes` / `no` accept bigint so weighted (token-balance-based) tallies don't
+ *  lose precision past Number.MAX_SAFE_INTEGER. */
 export type ProposalOutcome = 'open' | 'passed' | 'failed' | 'pending';
 
 export function deriveOutcome(opts: {
-  yes: number;
-  no: number;
+  yes: number | bigint;
+  no: number | bigint;
   endSecs: number | bigint;
   nowSecs?: number;
 }): ProposalOutcome {
   const now = opts.nowSecs ?? Math.floor(Date.now() / 1000);
-  const end = typeof opts.endSecs === 'bigint' ? Number(opts.endSecs) : opts.endSecs;
+  const end =
+    typeof opts.endSecs === 'bigint' ? Number(opts.endSecs) : opts.endSecs;
   if (now < end) return 'open';
-  if (opts.yes === 0 && opts.no === 0) return 'pending';
-  if (opts.yes > opts.no) return 'passed';
+  const yes = typeof opts.yes === 'bigint' ? opts.yes : BigInt(opts.yes);
+  const no = typeof opts.no === 'bigint' ? opts.no : BigInt(opts.no);
+  if (yes === 0n && no === 0n) return 'pending';
+  if (yes > no) return 'passed';
   return 'failed';
+}
+
+/** Format a token-base-units bigint with `decimals` decimal places. Strips
+ *  trailing zeros and groups the integer part with commas for legibility.
+ *  Used to render gov-token weights and balances in the UI. */
+export function formatTokenAmount(
+  base: bigint | number | string,
+  decimals: number,
+): string {
+  const value = typeof base === 'bigint' ? base : BigInt(base);
+  const negative = value < 0n;
+  const magnitude = negative ? -value : value;
+  if (decimals <= 0) {
+    return (negative ? '-' : '') + groupThousands(magnitude.toString());
+  }
+  const divisor = 10n ** BigInt(decimals);
+  const whole = magnitude / divisor;
+  const frac = (magnitude % divisor)
+    .toString()
+    .padStart(decimals, '0')
+    .replace(/0+$/, '');
+  const wholeStr = groupThousands(whole.toString());
+  const out = frac ? `${wholeStr}.${frac}` : wholeStr;
+  return negative ? `-${out}` : out;
+}
+
+function groupThousands(s: string): string {
+  return s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+/** Compute the percentage of weighted yes votes (0–100, rounded). Returns 0
+ *  when there are no votes at all so callers can render an empty bar. */
+export function yesPercent(yes: bigint, no: bigint): number {
+  const total = yes + no;
+  if (total === 0n) return 0;
+  // Multiply by 10000 first then divide to keep two decimals of precision
+  // before rounding — avoids "5/9 = 55.5...%" rendering as 56% but its
+  // complementary "no" reads as 45% (totaling 101).
+  const scaled = (yes * 10_000n) / total;
+  return Math.round(Number(scaled) / 100);
 }
 
 /** Translate a raw Soroban simulation error into something a user can act on.
@@ -150,6 +196,8 @@ export function decodeSimError(raw: string): string {
     return 'This proposal is closed — voting window has ended.';
   if (raw.includes('already voted'))
     return 'You have already voted on this proposal.';
+  if (raw.includes('no voting power'))
+    return 'You need at least 1 governance token to vote on this proposal.';
   if (raw.toLowerCase().includes('insufficient'))
     return 'Insufficient balance for this transaction.';
   if (raw.includes('Account_does_not_exist'))
