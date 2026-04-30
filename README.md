@@ -108,10 +108,7 @@ Built for the **Stellar Journey to Mastery: Monthly Builder Challenges** belt tr
 
 > Screenshots live in `docs/screenshots/`.
 
-1. ![Wallet connected](docs/screenshots/01-wallet-connected.png) — wallet connected
-2. ![Balance displayed](docs/screenshots/02-balance.png) — XLM + gov-token balance rendered
-3. ![Vote-fee sent](docs/screenshots/03-vote-fee-sent.png) — L1 XLM payment in flight / just-completed
-4. ![Vote-fee result](docs/screenshots/04-vote-fee-result.png) — tx hash + explorer link
+1. ![L1 all-in-one](docs/screenshots/01-wallet-connected.png) — wallet connected + balance displayed + vote-fee XLM tx sent + tx result (all four L1 requirements in one screenshot)
 5. ![Wallet options modal](docs/screenshots/05-wallet-options.png) — `StellarWalletsKit.authModal()` picker
 6. ![Tests passing](docs/screenshots/06-tests-passing.png) — `cargo test` + `npm test` green
 7. ![Mobile responsive](docs/screenshots/07-mobile.png) — captured at 390×844 (iPhone 12 Pro) in Chrome devtools
